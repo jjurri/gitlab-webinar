@@ -1,0 +1,159 @@
+stages:
+  - build
+  - make_image
+  - deploy
+
+build_back:
+  stage: build
+  image:
+    name: "composer:1.9.3"
+  script:
+    - composer install
+    - rm -rf .git
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - ./vendor/
+  artifacts:
+    when: always
+    paths:
+      - .
+    expire_in: 1 week
+  
+build_back_host:
+  stage: build
+  variables:
+    CI_DEBUG_TRACE: "true"  
+  script:
+    - pwd
+    - composer install
+    - ls -lah ./vendor
+    - rm -rf .git    
+  artifacts:
+    when: always
+    paths:
+      - .
+    expire_in: 1 week    
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - ./vendor/
+  tags: 
+    - vm_deploy
+#  when: manual    
+
+build_back_host_all_in_one:
+  stage: build
+  script:
+   - export WWW_ROOT="/var/www/$CI_PROJECT_NAMESPACE"
+   - export PROJECT_FOLDER="$WWW_ROOT/$CI_PROJECT_NAME-all/$CI_COMMIT_REF_NAME"
+   - export RELEASE_FOLDER="$PROJECT_FOLDER/release"
+   - export CURRENT_BRANCH_FOLDER="$PROJECT_FOLDER/commits/$CI_COMMIT_SHORT_SHA"
+   - mkdir -p $CURRENT_BRANCH_FOLDER
+   - rsync --exclude '.git*' -r ./ $CURRENT_BRANCH_FOLDER   
+   - cd $CURRENT_BRANCH_FOLDER
+   #framework specific    make artisan:deploy
+   - composer install
+   - envsubst < .env.$CI_COMMIT_REF_SLUG > .env
+   #- php artisan key:generate
+   - chmod -R 777 ./storage
+   - php artisan migrate
+   ###############################
+   - ln -sfT $CURRENT_BRANCH_FOLDER $RELEASE_FOLDER
+   - sudo systemctl reload nginx
+   - sudo systemctl reload php-fpm.service
+   #- sudo ln -fs $RELEASE_FOLDER/public/vendor $RELEASE_FOLDER/dist
+  tags: 
+    - vm_deploy
+#  when: manual
+  
+
+make_image_back:
+  stage: make_image
+  needs: ["build_back"]
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - ls -lah
+    - "/kaniko/executor --cache=true --cache-repo=$CI_REGISTRY/$CI_PROJECT_PATH --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --destination $CI_REGISTRY/$CI_PROJECT_PATH:latest --destination $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA"
+#  when: manual
+
+deploy_back_vm:
+  stage: deploy
+  needs: ["build_back_host"]
+  script:
+   - export WWW_ROOT="/var/www/$CI_PROJECT_NAMESPACE"
+   - export PROJECT_FOLDER="$WWW_ROOT/$CI_PROJECT_NAME/$CI_COMMIT_REF_NAME"
+   - export RELEASE_FOLDER="$PROJECT_FOLDER/release"
+   - export CURRENT_BRANCH_FOLDER="$PROJECT_FOLDER/commits/$CI_COMMIT_SHORT_SHA"
+   - mkdir -p $CURRENT_BRANCH_FOLDER
+   - pwd
+   - rsync --exclude '.git*' -r ./ $CURRENT_BRANCH_FOLDER   
+   - cd $CURRENT_BRANCH_FOLDER
+   #  The latest artifacts are created by jobs in the most recent successful pipeline for the specific ref
+   #- "curl --header \"PRIVATE-TOKEN: $TOOOKEN\" -L $CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_BUILD_REF_NAME/download?job=build_back_host -o art.zip"
+   - envsubst < .env.$CI_COMMIT_REF_SLUG > .env
+   - chmod -R 777 ./storage
+   #- php artisan key:generate - вынесли в переменную
+   - php artisan migrate
+   - ln -sfT $CURRENT_BRANCH_FOLDER $RELEASE_FOLDER
+   - sudo systemctl reload nginx
+   - sudo systemctl reload php-fpm.service
+  tags: 
+    - vm_deploy
+#  when: manual
+  
+review:
+  stage: deploy
+  needs: ["make_image_back"]  
+  environment:
+    name: "$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG"
+    url: "https://$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG.cluster.local/"
+    on_stop: stop_review  
+    #auto_stop_in: 1 day
+
+  image:
+    name: dtzar/helm-kubectl:2.16.1
+  variables:
+#      CI_DEBUG_TRACE: "true"
+    KUBER_NAMESPACE: $CI_PROJECT_NAMESPACE-$CI_COMMIT_REF_SLUG
+#  как переопределить namespace, у меня не вышло :(    
+#      KUBE_NAMESPACE: $CI_PROJECT_NAMESPACE-$CI_COMMIT_REF_SLUG
+#      KUBERNETES_NAMESPACE_OVERWRITE: mynamespace
+#      kubernetes_namespace_overwrite_allowed: .*
+#      namespace_overwrite_allowed: .*
+#      KUBERNETES_NAMESPACE_OVERWRITE_ALLOWED: .*
+#      KUBERNETES_NAMESPACE_OVERWRITE: mynamespace    
+#      KUBERNETES_SERVICE_ACCOUNT_OVERWRITE_ALLOWED: .*    
+#      KUBERNETES_SERVICE_ACCOUNT_OVERWRITE: gitlab-admin
+#      KUBERNETES_SERVICE_ACCOUNT_OVERWRITE_ALLOWED: gitlab-admin
+        
+  script:
+    - git clone https://$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD@gitlab.rebrainme.com/testdeploy/$CI_PROJECT_NAME-deploy
+    - apk add gettext curl git --no-cache
+    - export GOOGLE_APPLICATION_CREDENTIALS=$serviceaccountkey
+    - export KUBECONFIG=$config
+    - envsubst < .env.$CI_COMMIT_REF_SLUG > testback-deploy/files/.env
+    - sed -i 's/=\([^"].*\)/="\1"/g' testback-deploy/files/.env
+    - kubectl create namespace $KUBER_NAMESPACE && sleep 1
+    - helm init --client-only
+    - "helm upgrade --install --force $CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG  --namespace=$KUBER_NAMESPACE --set image.tag=$CI_COMMIT_SHORT_SHA,mysql.enabled=true,mysql.mysqlRootPassword=$CI_MASTER_DB_PASSWORD,mysql.mysqlUser=$CI_MASTER_DB_USER,mysql.mysqlPassword=$CI_MASTER_DB_PASSWORD,mysql.mysqlDatabase=$CI_MASTER_DB_USER,imageCredentials.registry=$CI_REGISTRY,imageCredentials.username=$CI_REGISTRY_USER,imageCredentials.password=$CI_REGISTRY_PASSWORD --debug $CI_PROJECT_NAME-deploy/"
+    
+stop_review:
+  stage: deploy
+  image:
+    name: dtzar/helm-kubectl:2.16.1
+  variables:
+    GIT_STRATEGY: none
+    #CI_DEBUG_TRACE: "true"
+  script:
+    - export GOOGLE_APPLICATION_CREDENTIALS=$serviceaccountkey
+    - export KUBECONFIG=$config
+    - helm delete --purge $CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG --namespace=$KUBER_NAMESPACE
+    #- kubectl delete namespace $KUBER_NAMESPACE && ls
+  when: manual
+  environment:
+    name: "$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG"
+    action: stop

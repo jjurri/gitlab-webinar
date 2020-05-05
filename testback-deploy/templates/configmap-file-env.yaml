@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "testback.fullname" . }}-env
+  labels:
+    app: {{ template "testback.name" . }}
+    chart: {{ template "testback.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+data:
+  .env: |+
+{{.Files.Get "files/.env" | printf "%s" | indent 4}}
+
+

@@ -1,0 +1,159 @@
+stages:
+  - build
+  - make_image
+  - deploy
+
+# собираем и ставим на одной машине.  php-fpm+nginx[+nodejs12]
+# usermod -aG gitlab-runner www:data
+# chown -R gitlab-runner:www-data /var/www/
+# chown 2775 /var/www/ наследование группы от родительского каталога
+build_front_host_all_in_one:
+  stage: build
+  script:
+   - export WWW_ROOT="/var/www/$CI_PROJECT_NAMESPACE"
+   - export PROJECT_FOLDER="$WWW_ROOT/$CI_PROJECT_NAME-all/$CI_COMMIT_REF_NAME"
+   - export RELEASE_FOLDER="$PROJECT_FOLDER/release"
+   - export CURRENT_BRANCH_FOLDER="$PROJECT_FOLDER/commits/$CI_COMMIT_SHORT_SHA"
+   - mkdir -p $CURRENT_BRANCH_FOLDER
+   - echo "VUE_APP_BACKEND_URL=http://161.35.70.114:8080/" > .env
+   - pwd
+   - npm install
+   - npm run build  
+   - rsync -r dist ./ $CURRENT_BRANCH_FOLDER/
+   - cd $CURRENT_BRANCH_FOLDER 
+   - ln -sfT $CURRENT_BRANCH_FOLDER $RELEASE_FOLDER
+   - sudo systemctl reload nginx
+   - sudo systemctl reload php-fpm.service
+  tags: 
+    - vm_deploy     
+
+# Если nodejs используется для сборки и не нужен для runtime, логично его вынести с продуктовой машины и собираться где-то еще
+# В данном случае машина одна и та же, но runner у нас будет другой.
+# Плюсы - все просто, есть кэширование из коробки. Даже если зависимости поменялись, она уже скачаны на хостовую машину
+build_front_host:
+  stage: build
+  variables:
+    CI_DEBUG_TRACE: "true"
+  script:
+    - pwd
+    - npm install
+    - npm run build
+  artifacts:
+    when: always
+    paths:
+      - ./dist/
+    expire_in: 1 week    
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - ./node_modules/
+  tags: 
+    - vm_deploy      
+
+#no cache if missed long downloading. Hard to pass volume
+build_front:
+  stage: build
+  image:
+    name: "node:12-alpine"
+  script:
+    - pwd
+    - export VUE_APP_BACKEND_URL="http://104.199.107.195.nip.io"  
+    #- echo "VUE_APP_BACKEND_URL=$VUE_APP_BACKEND_URL" > .env
+    - npm install
+    - npm run build
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - ./node_modules/
+  artifacts:
+    when: always
+    paths:
+      - ./dist/
+    expire_in: 1 week
+
+make_image_front:
+  stage: make_image
+  needs: ["build_front"]
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - ls -lah
+    - "/kaniko/executor --cache=true --cache-repo=$CI_REGISTRY/$CI_PROJECT_PATH --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --destination $CI_REGISTRY/$CI_PROJECT_PATH:latest --destination $CI_REGISTRY/$CI_PROJECT_PATH:front-$CI_COMMIT_SHORT_SHA
+#--build-arg ARTIFACT_URL=$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_REF_SLUG/download?job=build_front"
+#  when: manual
+  artifacts:
+    when: always
+    paths:
+      - ./dist/
+    expire_in: 1 week
+
+deploy_front_vm:
+  stage: deploy
+  needs: ["build_front_host"]
+  script:
+   - export WWW_ROOT="/var/www/$CI_PROJECT_NAMESPACE"
+   - export PROJECT_FOLDER="$WWW_ROOT/$CI_PROJECT_NAME/$CI_COMMIT_REF_NAME"
+   - export RELEASE_FOLDER="$PROJECT_FOLDER/release"
+   - export CURRENT_BRANCH_FOLDER="$PROJECT_FOLDER/commits/$CI_COMMIT_SHORT_SHA"
+   - pwd
+   - mkdir -p $CURRENT_BRANCH_FOLDER
+   - echo "VUE_APP_BACKEND_URL=$VUE_APP_BACKEND_URL" > .env
+   - rsync -r dist ./ $CURRENT_BRANCH_FOLDER/
+   # Как скачать артефакты. Качать нужно через id конкретной job, иначе получите артефакты с предыдущего pipeline
+   #/usr/lib/gitlab-runner/gitlab-runner artifacts-uploader --url https:// --token [MASKED] --id 3205 --path ./dist/ --expire-in '1 week' --artifact-format zip --artifact-type archive
+   #- "curl --header \"PRIVATE-TOKEN: $TOOOKEN\" -L $CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_BUILD_REF_NAME/download?job=build_front_host -o art.zip"
+   #- unzip art.zip #&& rm art.zip  - в случае фэйла, первой команды пайплайн продолжит работу
+   - ln -sfT $CURRENT_BRANCH_FOLDER $RELEASE_FOLDER
+   - sudo systemctl reload nginx
+   - sudo systemctl reload php-fpm.service
+  
+  tags: 
+    - vm_deploy
+    
+review:
+  stage: deploy
+  needs: ["make_image_front"]  
+  environment:
+    name: "$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG"
+    url: "https://$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG.cluster.local/"
+    on_stop: stop_review  
+    #auto_stop_in: 1 day
+
+  image:
+    name: dtzar/helm-kubectl:2.14.3
+  variables:
+#      CI_DEBUG_TRACE: "true"
+    KUBER_NAMESPACE: $CI_PROJECT_NAMESPACE-$CI_COMMIT_REF_SLUG
+
+  script:
+    - git clone https://$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD@gitlab.rebrainme.com/testdeploy/$CI_PROJECT_NAME-deploy
+    - apk add gettext curl git --no-cache  
+    #  если нужен gcloud в образе
+    #  python3 py3-crcmod bash libc6-compat openssh-client gnupg --no-cache
+    #- curl -sSL https://sdk.cloud.google.com | bash
+    #- PATH=$PATH:/root/google-cloud-sdk/bin
+    - export GOOGLE_APPLICATION_CREDENTIALS=$serviceaccountkey
+    - export KUBECONFIG=$config
+    - kubectl create namespace $KUBER_NAMESPACE && ls # костыль
+    - helm init --client-only
+    - "helm upgrade --debug --install --force $CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG testfront-deploy --namespace=$KUBER_NAMESPACE --set image.tag=front-$CI_COMMIT_SHORT_SHA,imageCredentials.registry=$CI_REGISTRY,imageCredentials.username=$CI_REGISTRY_USER,imageCredentials.password=$CI_REGISTRY_PASSWORD,ingress.hosts[0].host='104.199.107.195.nip.io',ingress.hosts[0].paths[0]='/'"
+    
+
+stop_review:
+  stage: deploy
+  image:
+    name: dtzar/helm-kubectl:2.14.3
+  variables:
+    GIT_STRATEGY: none
+    #CI_DEBUG_TRACE: "true"
+  script:
+    - export GOOGLE_APPLICATION_CREDENTIALS=$serviceaccountkey
+    - export KUBECONFIG=$config
+    - helm delete --purge $CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG --namespace=$KUBER_NAMESPACE
+    #- kubectl delete namespace $KUBER_NAMESPACE && 1
+  when: manual
+  environment:
+    name: "$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG"
+    action: stop      
